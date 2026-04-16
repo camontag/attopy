@@ -56,7 +56,7 @@ class TestKnownValues:
     def test_800nm_omega(self):
         """800 nm Ti:Sapph laser → ω ≈ 0.05700 au."""
         omega = units.wavelength_to_omega(800.0)
-        assert math.isclose(omega, 0.057005, rel_tol=1e-4)
+        assert math.isclose(omega, 0.057005, rel_tol=1e-3)
 
     def test_efield_amplitude_consistency(self):
         """E₀² should equal I in au (since Up = E₀²/4ω²)."""

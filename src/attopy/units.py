@@ -116,7 +116,7 @@ def wavelength_to_omega(lambda_nm: float) -> float:
     Parameters
     ----------
     lambda_nm : float
-        Wavelength in nanometres.
+        Wavelength in nanometers.
 
     Returns
     -------
@@ -131,7 +131,7 @@ def wavelength_to_omega(lambda_nm: float) -> float:
     import math
     # λ in au: 1 nm = 10 Å = 10 / BOHR_TO_ANGSTROM bohr
     lambda_au = lambda_nm * 10.0 * ANGSTROM_TO_BOHR
-    return 2.0 * math.pi / lambda_au
+    return 2.0 * math.pi * C_AU / lambda_au
 
 
 def omega_to_wavelength(omega_au: float) -> float:
@@ -145,10 +145,10 @@ def omega_to_wavelength(omega_au: float) -> float:
     Returns
     -------
     float
-        Wavelength in nanometres.
+        Wavelength in nanometers.
     """
     import math
-    lambda_au = 2.0 * math.pi / omega_au
+    lambda_au = 2.0 * math.pi * C_AU / omega_au
     return lambda_au * BOHR_TO_ANGSTROM / 10.0
 
 
