@@ -29,10 +29,6 @@ A Python toolkit for strong-field TDSE simulations, targeting attosecond and ult
 
 ## Installation
 
-```bash
-pip install attopy
-```
-
 For development:
 
 ```bash
