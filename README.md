@@ -1,4 +1,4 @@
-# attopy
+# AttoPy
 
 [![Tests](https://github.com/camontag/attopy/actions/workflows/tests.yml/badge.svg)](https://github.com/camontag/attopy/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -6,7 +6,7 @@
 
 A Python toolkit for strong-field TDSE simulations, targeting attosecond and ultrafast physics research.
 
-**attopy** provides a clean, NumPy-native interface for propagating the time-dependent Schrödinger equation (TDSE) in intense laser fields, with built-in tools for computing strong-field observables such as high-harmonic generation (HHG) spectra and above-threshold ionization (ATI) yields.
+**AttoPy** provides a clean, NumPy-native interface for propagating the time-dependent Schrödinger equation (TDSE) in intense laser fields, with built-in tools for computing strong-field observables such as high-harmonic generation (HHG) spectra and above-threshold ionization (ATI) yields.
 
 ---
 
@@ -51,7 +51,7 @@ pip install -e ".[dev]"
 
 ## Project Status
 
-attopy is being developed as part of a PhD research project in strong-field physics. The development follows a phased plan targeting a JOSS publication.
+AttoPy is being developed as part of a PhD research project in strong-field physics.
 
 | Phase | Status | Description |
 |---|---|---|
@@ -66,7 +66,7 @@ attopy is being developed as part of a PhD research project in strong-field phys
 
 ## Citation
 
-If you use attopy in your research, please cite:
+If you use AttoPy in your research, please cite:
 
 ```bibtex
 @software{attopy,
