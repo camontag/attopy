@@ -11,9 +11,15 @@ Time evolution over one step Δt uses the symmetric Strang splitting:
 
     exp(-iH·Δt) ≈ exp(-iV·Δt/2) · exp(-iT·Δt) · exp(-iV·Δt/2) + O(Δt³)
 
-Consecutive half-V steps are merged into full V-steps for efficiency, so
-the loop body is: full-V → FFT → kinetic phase → IFFT, with half-V steps
-only at the very start and very end.
+This backend implements _advance_step(), which applies one full V/T/V
+sequence per call. The base class PropagatorBase owns the time-stepping
+loop and observable recording.
+
+Note: the merged V-step optimization (combining consecutive half-V steps
+into a single full-V step) is not implemented here because it requires
+cross-step state that conflicts with the _advance_step() interface. The
+performance difference is negligible for typical strong-field grid sizes
+since potential evaluations are cheap relative to FFT pairs.
 
 Requires a uniformly spaced position grid. Raises ValueError if xgrid is
 non-uniform, rather than silently producing incorrect results.
@@ -25,8 +31,6 @@ All quantities are in atomic units unless stated otherwise.
 
 from __future__ import annotations
 
-import time
-
 import numpy as np
 
 from attopy.propagators.base import PropagatorBase, PropagatorResult
@@ -34,6 +38,10 @@ from attopy.propagators.base import PropagatorBase, PropagatorResult
 
 class SplitOperatorPropagator(PropagatorBase):
     """Split-operator FFT propagator for the 1D TDSE.
+
+    Implements the symmetric Strang splitting: V/2 → T → V/2 per step.
+    The time-stepping loop and observable recording are handled by the
+    base class PropagatorBase.
 
     Parameters
     ----------
@@ -45,9 +53,9 @@ class SplitOperatorPropagator(PropagatorBase):
         Position grid in atomic units. Must be uniformly spaced
         with spacing dx.
     store_psi : bool, optional
-        If True (default), store the full wavefunction at every time step
-        in PropagatorResult.psi. If False, only the final wavefunction is
-        stored, reducing memory usage for long propagations.
+        If True (default), store the full wavefunction at every time step.
+        If False, only the final wavefunction is retained, saving memory
+        for long propagations. Observables (norm, dipole) are always stored.
 
     Raises
     ------
@@ -58,13 +66,15 @@ class SplitOperatorPropagator(PropagatorBase):
     --------
     >>> import numpy as np
     >>> from attopy.propagators.splitop import SplitOperatorPropagator
-    >>> N, dx = 512, 0.2
-    >>> xgrid = np.arange(N) * dx - N * dx / 2
-    >>> prop = SplitOperatorPropagator(dx=dx, dt=0.05, xgrid=xgrid)
-    >>> psi0 = np.exp(-xgrid**2 / 2, dtype=complex)   # Gaussian
+    >>> N, dx, dt = 256, 0.05, 0.01
+    >>> xgrid = np.linspace(-N // 2 * dx, N // 2 * dx, N, endpoint=False)
+    >>> prop = SplitOperatorPropagator(dx=dx, dt=dt, xgrid=xgrid)
+    >>> V = 0.5 * xgrid**2                          # harmonic oscillator
+    >>> psi0 = (1/np.pi)**0.25 * np.exp(-0.5*xgrid**2).astype(complex)
     >>> psi0 /= np.sqrt(np.sum(np.abs(psi0)**2) * dx)
-    >>> tgrid = np.linspace(0, 10.0, 200)
-    >>> result = prop.propagate(psi0, tgrid, V=np.zeros(N), pulse=lambda t: 0.0)
+    >>> n = int(round(2*np.pi / dt))
+    >>> tgrid = np.linspace(0, n * dt, n + 1)
+    >>> result = prop.propagate(psi0, tgrid, V.astype(complex), pulse=lambda t: 0.0)
     """
 
     def __init__(
@@ -78,15 +88,16 @@ class SplitOperatorPropagator(PropagatorBase):
         _check_uniform_grid(xgrid, dx)
 
         N = len(xgrid)
-        # Momentum grid (au): k = 2π · fftfreq(N, d=dx)
+        # Momentum grid: k = 2π · fftfreq(N, d=dx)
         self._k = 2.0 * np.pi * np.fft.fftfreq(N, d=dx)
-        # Kinetic phase factor — precomputed once, never changes
+        # Kinetic phase factor — precomputed once at construction time
         # T = k²/2  →  exp(-i·T·dt) = exp(-i·k²·dt/2)
         self._kinetic_phase = np.exp(-0.5j * self._k**2 * dt)
 
-    # ------------------------------------------------------------------
-    # Public interface
-    # ------------------------------------------------------------------
+        # Store V between propagate() calls so _advance_step can access it.
+        # Set in propagate() before the loop starts.
+        self._V: np.ndarray | None = None
+        self._pulse: callable | None = None
 
     def propagate(
         self,
@@ -103,22 +114,18 @@ class SplitOperatorPropagator(PropagatorBase):
         psi0 : np.ndarray, shape (N,), complex
             Initial wavefunction. Normalised internally if needed.
         tgrid : np.ndarray, shape (Nt,)
-            Time points in atomic units at which to record observables
-            and (optionally) the wavefunction. Must be monotonically
-            increasing and uniformly spaced.
-        V : np.ndarray, shape (N,)
-            Field-free potential on the position grid, in atomic units.
-            Typically a soft-core Coulomb or harmonic oscillator potential.
-            May include a complex absorbing potential (CAP) as an imaginary
-            part: V_total = V_real + i·V_CAP.
+            Time points in atomic units. Must be monotonically increasing
+            with spacing equal to dt.
+        V : np.ndarray, shape (N,), complex
+            Field-free potential in atomic units. Real part is the physical
+            potential; imaginary part (if any) is a complex absorbing
+            potential (CAP).
         pulse : callable
-            Laser pulse function with signature pulse(t) -> float.
-            Returns the electric field amplitude E(t) in atomic units
-            at time t. For zero field, pass lambda t: 0.0.
+            Laser pulse with signature pulse(t) -> float, returning the
+            electric field amplitude E(t) in atomic units. For zero field,
+            pass lambda t: 0.0.
         callback : callable, optional
-            Called at each time step as callback(t, psi). Use to compute
-            custom observables mid-propagation without storing full psi
-            history. Return value is ignored.
+            Called at each step as callback(t, psi).
 
         Returns
         -------
@@ -126,112 +133,69 @@ class SplitOperatorPropagator(PropagatorBase):
 
         Notes
         -----
-        The laser interaction is treated in the length gauge:
-            V_laser(x, t) = E(t) · x
-        The total effective potential at each half-step is:
-            V_eff(x, t) = V(x) + E(t) · x
+        Laser interaction in the length gauge: V_laser(x, t) = E(t) · x.
+        Total effective potential: V_eff(x, t) = V(x) + E(t) · x.
         """
-        t_start = time.time()
-        psi0 = self._validate_inputs(psi0, tgrid)
-        _check_uniform_grid(self.xgrid, self.dx)
+        V = np.asarray(V, dtype=np.complex128)
+        psi0_validated = self._validate_inputs(psi0, tgrid)
+
+        if V.shape != psi0_validated.shape:
+            raise ValueError(
+                f"V.shape {V.shape} does not match psi0.shape {psi0_validated.shape}"
+            )
         _check_tgrid_dt_consistency(tgrid, self.dt)
 
-        V = np.asarray(V, dtype=np.complex128)
-        if V.shape != psi0.shape:
-            raise ValueError(
-                f"V.shape {V.shape} does not match psi0.shape {psi0.shape}"
-            )
+        # Store V and pulse so _advance_step can access them
+        self._V = V
+        self._pulse = pulse
 
-        psi, psi_history, norm_history, dipole_history = self._run_loop(
-            psi0, tgrid, V, pulse, callback
-        )
+        try:
+            result = super().propagate(psi0, tgrid, V, pulse, callback)
+        finally:
+            # Always clear references to avoid accidental reuse
+            self._V = None
+            self._pulse = None
 
-        return self._make_result(
-            tgrid=tgrid,
-            psi_history=psi_history,
-            norm_history=norm_history,
-            dipole_history=dipole_history,
-            wall_time=time.time() - t_start,
-        )
+        return result
 
-    # ------------------------------------------------------------------
-    # Private: propagation loop
-    # ------------------------------------------------------------------
-
-    def _run_loop(
+    def _advance_step(
         self,
         psi: np.ndarray,
-        tgrid: np.ndarray,
+        t_start: float,
+        t_end: float,
         V: np.ndarray,
         pulse: callable,
-        callback: callable | None,
-    ) -> tuple[np.ndarray, list, list, list]:
-        """Core propagation loop.
+    ) -> np.ndarray:
+        """Advance wavefunction by one step using V/2 → T → V/2 splitting.
 
-        Uses the merged V-step optimisation: consecutive half-V steps
-        from adjacent time steps are combined into a single full V-step,
-        halving the number of potential evaluations.
-
-        The sequence is:
-            half-V(t0) → [T → full-V(t)] × (Nt-1) → T → half-V(t_final)
+        Parameters
+        ----------
+        psi : np.ndarray, shape (N,), complex
+            Wavefunction at t_start.
+        t_start : float
+            Start of the time step (au).
+        t_end : float
+            End of the time step (au).
+        V : np.ndarray, shape (N,), complex
+            Field-free potential.
+        pulse : callable
+            Laser pulse function.
 
         Returns
         -------
-        tuple of (final psi, psi_history, norm_history, dipole_history)
+        np.ndarray, shape (N,), complex
+            Wavefunction at t_end.
         """
-        Nt = len(tgrid)
         dt = self.dt
-        dx = self.dx
         xgrid = self.xgrid
+        t_mid = 0.5 * (t_start + t_end)
+        E_mid = pulse(t_mid)          # evaluate once at midpoint
 
-        psi_history = []
-        norm_history = []
-        dipole_history = []
+        psi = _apply_V_half(psi, V, E_mid, xgrid, dt)   # half-V at t_mid
+        psi = _apply_T(psi, self._kinetic_phase)          # full T
+        psi = _apply_V_half(psi, V, E_mid, xgrid, dt)   # half-V at t_mid again
 
-        def record(psi: np.ndarray, t: float) -> None:
-            """Store observables and optionally wavefunction."""
-            norm = _compute_norm(psi, dx)
-            dipole = _compute_dipole(psi, xgrid, dx)
-            norm_history.append(norm)
-            dipole_history.append(dipole)
-            if self.store_psi:
-                psi_history.append(psi.copy())
-            else:
-                psi_history.append(None)   # placeholder; only final used
-            if callback is not None:
-                callback(t, psi)
-
-        # --- Initial half-V step at t = tgrid[0] ---
-        E0 = pulse(tgrid[0])
-        psi = _apply_V_half(psi, V, E0, xgrid, dt)
-        record(psi, tgrid[0])
-
-        # --- Main loop: T-step then full-V step ---
-        for n in range(1, Nt):
-            t = tgrid[n]
-
-            # Full kinetic step in momentum space
-            psi = _apply_T(psi, self._kinetic_phase)
-
-            if n < Nt - 1:
-                # Merge: second half of step n + first half of step n+1
-                # Both evaluated at the midpoint time t_mid
-                t_mid = 0.5 * (tgrid[n] + tgrid[n + 1])
-                E_mid = pulse(t_mid)
-                psi = _apply_V_full(psi, V, E_mid, xgrid, dt)
-            else:
-                # Final half-V step at the last time point
-                E_final = pulse(t)
-                psi = _apply_V_half(psi, V, E_final, xgrid, dt)
-
-            record(psi, t)
-
-        # If store_psi=False, replace placeholder list with final psi only
-        if not self.store_psi:
-            final = psi.copy()
-            psi_history = [np.zeros_like(psi)] * (Nt - 1) + [final]
-
-        return psi, psi_history, norm_history, dipole_history
+        return psi
 
 
 # ---------------------------------------------------------------------------
@@ -239,25 +203,10 @@ class SplitOperatorPropagator(PropagatorBase):
 # ---------------------------------------------------------------------------
 
 def _check_tgrid_dt_consistency(tgrid: np.ndarray, dt: float, rtol: float = 1e-6) -> None:
-    """Raise ValueError if tgrid spacing is inconsistent with dt.
+    """Raise ValueError if tgrid spacing does not match dt.
 
-    The propagator takes exactly one step of size dt per tgrid interval.
-    If the tgrid spacing differs from dt, the simulation will silently
-    integrate over the wrong time interval.
-
-    Parameters
-    ----------
-    tgrid : np.ndarray
-        Time grid passed to propagate().
-    dt : float
-        Time step the propagator was constructed with.
-    rtol : float
-        Relative tolerance for the check.
-
-    Raises
-    ------
-    ValueError
-        If tgrid spacing does not match dt within rtol.
+    The base class loop takes exactly one step of size dt per tgrid interval.
+    A mismatch causes the simulation to integrate over the wrong time interval.
     """
     if len(tgrid) < 2:
         return
@@ -265,10 +214,8 @@ def _check_tgrid_dt_consistency(tgrid: np.ndarray, dt: float, rtol: float = 1e-6
     if not np.isclose(tgrid_dt, dt, rtol=rtol):
         raise ValueError(
             f"tgrid spacing ({tgrid_dt:.6f} au) does not match propagator "
-            f"dt ({dt:.6f} au). The propagator takes exactly one step of "
-            f"size dt per tgrid interval. Either adjust tgrid spacing to "
-            f"match dt, or reconstruct the propagator with "
-            f"dt={tgrid_dt:.6f}."
+            f"dt ({dt:.6f} au). Either adjust tgrid spacing to match dt, "
+            f"or reconstruct the propagator with dt={tgrid_dt:.6f}."
         )
 
 
@@ -290,14 +237,11 @@ def _apply_V_half(
     xgrid: np.ndarray,
     dt: float,
 ) -> np.ndarray:
-    """Apply half a potential step in position space.
+    """Apply half a potential step: psi *= exp(-i·V_eff·dt/2).
 
-    psi *= exp(-i · V_eff(x, t) · dt/2)
-
-    where V_eff(x, t) = V(x) + E(t)·x
+    V_eff(x, t) = V(x) + E(t)·x
     """
-    phase = np.exp(-0.5j * (V + E * xgrid) * dt)
-    return psi * phase
+    return psi * np.exp(-0.5j * (V + E * xgrid) * dt)
 
 
 def _apply_V_full(
@@ -307,21 +251,15 @@ def _apply_V_full(
     xgrid: np.ndarray,
     dt: float,
 ) -> np.ndarray:
-    """Apply a full potential step in position space.
+    """Apply a full potential step: psi *= exp(-i·V_eff·dt).
 
-    psi *= exp(-i · V_eff(x, t) · dt)
-
-    where V_eff(x, t) = V(x) + E(t)·x
+    V_eff(x, t) = V(x) + E(t)·x
     """
-    phase = np.exp(-1.0j * (V + E * xgrid) * dt)
-    return psi * phase
+    return psi * np.exp(-1.0j * (V + E * xgrid) * dt)
 
 
 def _apply_T(psi: np.ndarray, kinetic_phase: np.ndarray) -> np.ndarray:
-    """Apply the full kinetic step in momentum space.
-
-    FFT → multiply by exp(-i·k²·dt/2) → IFFT
-    """
+    """Apply the full kinetic step: FFT → kinetic phase → IFFT."""
     return np.fft.ifft(kinetic_phase * np.fft.fft(psi))
 
 
